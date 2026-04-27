@@ -5,6 +5,13 @@ Loads the best model saved during training and reports:
   - Classification metrics on the test set (precision, recall, F1, AUC)
   - Autoencoder reconstruction error per class (useful for anomaly-style
     detection: attacks should reconstruct worse than benign traffic)
+
+Note on model loading
+---------------------
+The training compiles the model with a custom weighted-BCE loss (defined
+in model.py for class-imbalance handling). To load the model for
+INFERENCE, we set compile=False — we only need predictions, not gradients,
+so we can skip recreating the loss function at load time.
 """
 
 from __future__ import annotations
@@ -23,7 +30,11 @@ def main() -> None:
     df = load_cicids2017()
     data = build_dataset(df, timesteps=config.TIMESTEPS)
 
-    model = tf.keras.models.load_model(config.MODELS_DIR / "best_model.keras")
+    # compile=False to skip rebuilding the custom loss at load time
+    model = tf.keras.models.load_model(
+        config.MODELS_DIR / "best_model.keras",
+        compile=False,
+    )
     print("[evaluate] Loaded best model.")
 
     X_test, y_test = data["X_test"], data["y_test"]

@@ -172,7 +172,9 @@ def main():
     if not model_path.exists():
         model_path = config.MODELS_DIR / "final_model.keras"
     print(f"[viz] Loading model from {model_path}")
-    model = tf.keras.models.load_model(model_path)
+
+    # compile=False to skip rebuilding the custom loss at load time
+    model = tf.keras.models.load_model(model_path, compile=False)
 
     X_test, y_test = data["X_test"], data["y_test"]
     cls_pred, ae_pred = model.predict(X_test, batch_size=config.BATCH_SIZE, verbose=1)

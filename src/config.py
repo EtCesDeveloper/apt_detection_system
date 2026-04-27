@@ -29,8 +29,8 @@ N_FEATURES = 70          # Final feature count after cleaning (set dynamically)
 # ---------------------------------------------------------------------------
 # Training hyperparameters
 # ---------------------------------------------------------------------------
-BATCH_SIZE = 512
-EPOCHS = 10
+BATCH_SIZE = 256
+EPOCHS = 30
 LEARNING_RATE = 1e-3
 VAL_SPLIT = 0.15
 TEST_SPLIT = 0.15

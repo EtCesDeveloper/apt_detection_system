@@ -10,16 +10,26 @@ Input  (batch, timesteps, features)
   -> classifier_output (Dense -> sigmoid)                     (binary detection)
   -> autoencoder_output (RepeatVector -> LSTM -> TimeDist)    (reconstruction)
 
+Why we use POSITIONAL lists (not dicts) for loss/metrics
+--------------------------------------------------------
+Keras 3 changed how multi-output models map dict-keyed losses/metrics to
+outputs. Using `metrics={"name": [...]}` can route metrics to the wrong
+output and produce shape mismatches (e.g. BinaryAccuracy from the
+classifier head being applied against the (B, T, F) AE output).
+
+The reliable pattern in Keras 3 for multi-output models is:
+  outputs       = [out_0, out_1]
+  loss          = [loss_0, loss_1]              # positional
+  loss_weights  = [w_0,    w_1]                  # positional
+  metrics       = [[m0_a, m0_b], [m1_a]]         # list of lists, positional
+
+This guarantees that loss[i] and metrics[i] are applied to outputs[i].
+
 Class imbalance handling
 ------------------------
-CICIDS2017 is imbalanced (~80% benign). Instead of using sample_weight
-(which produces broadcasting issues with multi-output models in Keras 3),
-we bake the class weight INTO a custom weighted-BCE loss for the
-classifier head. This is fully compatible with Keras 3 and multi-output
-models, and avoids any tf.data pipeline complications.
-
-The autoencoder head uses standard MSE; class imbalance is irrelevant
-there because the AE is a regression objective.
+We bake the class weights INTO a custom weighted-BCE loss for the
+classifier head. This avoids `class_weight` (unsupported on multi-output)
+and `sample_weight` (broadcasting issues with mixed-shape outputs).
 """
 
 from __future__ import annotations
@@ -32,28 +42,26 @@ from . import config
 
 def make_weighted_bce(class_weight: dict | None):
     """
-    Build a weighted binary-crossentropy loss that uses class_weight
-    internally. Returns the standard BCE if class_weight is None.
+    Build a binary-crossentropy loss with embedded class weights.
 
-    weight(y) = class_weight[1] * y + class_weight[0] * (1 - y)
-    loss(y, p) = weight(y) * BCE(y, p)
+    Returns a per-sample tensor of shape (B,). Keras 3 averages over the
+    batch automatically and applies loss_weights cleanly.
     """
     if class_weight is None:
         return tf.keras.losses.BinaryCrossentropy(name="binary_crossentropy")
 
-    w0 = tf.constant(class_weight[0], dtype=tf.float32)
-    w1 = tf.constant(class_weight[1], dtype=tf.float32)
+    w0 = tf.constant(float(class_weight[0]), dtype=tf.float32)
+    w1 = tf.constant(float(class_weight[1]), dtype=tf.float32)
 
     def weighted_bce(y_true, y_pred):
-        # y_true and y_pred have shape (batch, 1)
+        # y_true is (B, 1), y_pred is (B, 1)
         y_true_f = tf.cast(y_true, tf.float32)
-        # Per-sample BCE (no reduction over the batch yet)
+        # binary_crossentropy reduces last axis -> (B,)
         bce = tf.keras.losses.binary_crossentropy(y_true_f, y_pred)
-        # Per-sample class weight
-        sample_w = y_true_f * w1 + (1.0 - y_true_f) * w0
-        # Squeeze to match shapes: bce is (batch,), sample_w is (batch, 1) -> (batch,)
-        sample_w = tf.reshape(sample_w, tf.shape(bce))
-        return tf.reduce_mean(bce * sample_w)
+        # Per-sample weight, flattened to (B,)
+        y_flat = tf.reshape(y_true_f, [-1])
+        sample_w = y_flat * w1 + (1.0 - y_flat) * w0
+        return bce * sample_w
 
     weighted_bce.__name__ = "weighted_binary_crossentropy"
     return weighted_bce
@@ -67,40 +75,31 @@ def build_multitask_model(
     lstm_units: int = 128,
     latent_dim: int = 64,
     dropout: float = 0.3,
-    loss_weights: dict | None = None,
     learning_rate: float = config.LEARNING_RATE,
     class_weight: dict | None = None,
+    loss_weight_cls: float = config.LOSS_WEIGHT_CLASSIFIER,
+    loss_weight_ae:  float = config.LOSS_WEIGHT_AUTOENCODER,
 ) -> Model:
     """
     Build and compile the multitask CNN+LSTM model.
 
-    Parameters
-    ----------
-    class_weight : optional dict {0: w0, 1: w1}
-        If provided, the classifier head uses a weighted BCE loss that
-        bakes the class weights directly into the gradient. This is the
-        Keras-3-friendly alternative to sample_weight for multi-output
-        models.
+    Output order (matters for positional list mapping):
+      outputs[0] = classifier_output  (B, 1)
+      outputs[1] = autoencoder_output (B, T, F)
     """
-
-    if loss_weights is None:
-        loss_weights = {
-            "classifier_output":  config.LOSS_WEIGHT_CLASSIFIER,
-            "autoencoder_output": config.LOSS_WEIGHT_AUTOENCODER,
-        }
 
     # 1. INPUT
     inputs = Input(shape=(timesteps, n_features), name="input_sequence")
 
-    # 2. PREPROCESSING — in-graph LayerNormalization across the feature axis
+    # 2. PREPROCESSING — in-graph LayerNormalization
     x = layers.LayerNormalization(name="preproc_layernorm")(inputs)
 
     # 3. CNN BLOCK — local pattern extraction along the temporal axis
     x = layers.Conv1D(cnn_filters[0], cnn_kernel, padding="same",
-                       activation="relu", name="conv1d_1")(x)
+                      activation="relu", name="conv1d_1")(x)
     x = layers.BatchNormalization(name="bn_1")(x)
     x = layers.Conv1D(cnn_filters[1], cnn_kernel, padding="same",
-                       activation="relu", name="conv1d_2")(x)
+                      activation="relu", name="conv1d_2")(x)
     x = layers.BatchNormalization(name="bn_2")(x)
     x = layers.MaxPooling1D(pool_size=2, padding="same", name="maxpool_1")(x)
     x = layers.Dropout(dropout, name="dropout_cnn")(x)
@@ -119,7 +118,7 @@ def build_multitask_model(
         1, activation="sigmoid", name="classifier_output"
     )(c)
 
-    # 5B. AUTOENCODER HEAD
+    # 5B. AUTOENCODER HEAD — reconstruct (normalized) input sequence
     d = layers.RepeatVector(timesteps, name="ae_repeat")(encoded)
     d = layers.LSTM(lstm_units, return_sequences=True, name="ae_lstm")(d)
     autoencoder_output = layers.TimeDistributed(
@@ -127,34 +126,40 @@ def build_multitask_model(
         name="autoencoder_output",
     )(d)
 
-    # 6. MODEL
+    # 6. MODEL — positional output list. The order is fixed and used by
+    #    the positional loss/metrics lists below.
     model = Model(
         inputs=inputs,
         outputs=[classifier_output, autoencoder_output],
         name="cnn_lstm_multitask_apt",
     )
 
-    # 7. COMPILE — weighted BCE for the classifier, MSE for the AE
+    # 7. COMPILE — POSITIONAL lists mapped to outputs[0] and outputs[1].
     cls_loss = make_weighted_bce(class_weight)
 
     model.compile(
         optimizer=Adam(learning_rate=learning_rate),
-        loss={
-            "classifier_output":  cls_loss,
-            "autoencoder_output": "mean_squared_error",
-        },
-        loss_weights=loss_weights,
-        metrics={
-            "classifier_output": [
+        loss=[
+            cls_loss,                  # for outputs[0] = classifier_output
+            "mean_squared_error",      # for outputs[1] = autoencoder_output
+        ],
+        loss_weights=[
+            loss_weight_cls,           # for outputs[0]
+            loss_weight_ae,            # for outputs[1]
+        ],
+        metrics=[
+            # Metrics for outputs[0] = classifier_output
+            [
                 tf.keras.metrics.BinaryAccuracy(name="accuracy"),
                 tf.keras.metrics.Precision(name="precision"),
                 tf.keras.metrics.Recall(name="recall"),
                 tf.keras.metrics.AUC(name="auc"),
             ],
-            "autoencoder_output": [
+            # Metrics for outputs[1] = autoencoder_output
+            [
                 tf.keras.metrics.MeanSquaredError(name="mse"),
             ],
-        },
+        ],
     )
 
     return model
